@@ -1,0 +1,25 @@
+services:
+  llm-router:
+    build: .
+    container_name: llm-router
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      # Same key as llama-server --api-key on both servers.
+      # Consumers send this key to the router; the router sends it to the servers.
+      API_KEY: 1234567890
+      # How often to re-read each server's /v1/models (seconds).
+      MODELS_REFRESH_SECONDS: "60"
+      # Models are auto-discovered from each server's /v1/models.
+      # To set them by hand instead, add e.g. "models": ["llama-8b", "qwen-14b"] to a server.
+      ROUTER_BACKENDS: >-
+        [
+          {"name": "fast", "url": "http://192.168.20.9:8080", "slots": 2},
+          {"name": "slow", "url": "http://192.168.20.193:8081", "slots": 2}
+        ]
+    # If a backend runs on the same machine as this container, use
+    # http://host.docker.internal:8080 as its URL and uncomment:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
