@@ -70,15 +70,40 @@ def model_entry(mid: str, owner: str, src: dict | None = None) -> dict:
     for k in KEEP_FIELDS:
         if k in src:
             e[k] = src[k]
-    # llama.cpp reports the runtime context window under meta.n_ctx (not the
-    # OpenAI-standard context_length). Preserve it and also expose it as
-    # context_length for clients that expect a top-level field.
+    # llama.cpp's router mode can report a generic context_length (often the
+    # global default) for every model, while the real per-model value is in
+    # that model's preset args as --ctx-size. Prefer the configured value.
+    ctx_size = None
+    status = src.get("status")
+    args = status.get("args") if isinstance(status, dict) else None
+    if isinstance(args, list):
+        for i, a in enumerate(args):
+            if a == "--ctx-size" and i + 1 < len(args):
+                try:
+                    ctx_size = int(args[i + 1])
+                except (TypeError, ValueError):
+                    pass
+                break
+            if isinstance(a, str) and a.startswith("--ctx-size="):
+                try:
+                    ctx_size = int(a.split("=", 1)[1])
+                except (TypeError, ValueError):
+                    pass
+                break
+
     meta = src.get("meta") or e.get("meta") or {}
     n_ctx = meta.get("n_ctx") if isinstance(meta, dict) else None
-    if n_ctx is not None and "context_length" not in e:
-        e["context_length"] = n_ctx
-    if n_ctx is not None and "max_model_len" not in e:
-        e["max_model_len"] = n_ctx
+
+    if ctx_size is not None:
+        e["context_length"] = ctx_size
+        e["max_model_len"] = ctx_size
+        if isinstance(e.get("meta"), dict):
+            e["meta"]["n_ctx"] = ctx_size
+    elif n_ctx is not None:
+        if "context_length" not in e:
+            e["context_length"] = n_ctx
+        if "max_model_len" not in e:
+            e["max_model_len"] = n_ctx
     return e
  
  
