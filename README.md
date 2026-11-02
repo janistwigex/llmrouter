@@ -183,6 +183,8 @@ so clients that expect either nested or top-level context metadata can read it.
   `meta.n_ctx` in `/v1/models`; restart the router after backend changes.
 - **Slots exhausted:** increase backend `slots` and llama-server `-np`, or add
   another backend.
+- **Backend unreachable:** unhealthy backends are skipped and requests fail over to
+  other backends with the same model. If none are healthy, the router returns 503.
 - **Backend unreachable:** the previous model list is kept; check logs for
   discovery errors.
 
