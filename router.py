@@ -119,6 +119,7 @@ class Backend:
         self.models: dict[str, dict] = {m: model_entry(m, name) for m in (models or [])}
         self.loaded: str | None = None  # model last sent to this server
         self.active = 0                 # in-flight requests
+        self.healthy: bool = True       # last known reachability
  
  
 backends = [Backend(**b) for b in BACKENDS]
@@ -141,10 +142,12 @@ async def discover(b: Backend):
         if r.status_code in (401, 403):
             print(f"[router] {b.name}: {url} rejected the API key (HTTP {r.status_code}) "
                   f"- check API_KEY / api_key matches the server's key")
+            b.healthy = False
             return
         r.raise_for_status()
         data = [m for m in r.json().get("data", []) if "id" in m]
         b.models = {m["id"]: model_entry(m["id"], b.name, m) for m in data}
+        b.healthy = True
         # llama-server router mode reports which model is loaded; sync while idle
         loaded = [m["id"] for m in data
                   if isinstance(m.get("status"), dict) and m["status"].get("value") == "loaded"]
@@ -152,6 +155,7 @@ async def discover(b: Backend):
             print(f"[router] {b.name}: server reports '{loaded[0]}' loaded")
             b.loaded = loaded[0]
     except Exception as e:  # keep the previous list if the backend is unreachable
+        b.healthy = False
         print(f"[router] model discovery failed for {b.name} ({url}): "
               f"{type(e).__name__}: {e!r}")
  
@@ -207,7 +211,7 @@ def backend_headers(b: Backend, request: Request) -> dict:
 # ---------- routing ----------
  
 def candidates(model: str) -> list[Backend]:
-    return [b for b in backends if model in b.models]
+    return [b for b in backends if model in b.models and b.healthy]
  
  
 def pick(model: str) -> Backend | None:
@@ -263,8 +267,9 @@ async def models(request: Request):
 async def status(request: Request):
     if (err := unauthorized(request)):
         return err
-    return [{"name": b.name, "loaded": b.loaded, "active": b.active,
-             "slots": b.slots, "models": sorted(b.models)} for b in backends]
+    return [{"name": b.name, "healthy": b.healthy, "loaded": b.loaded,
+             "active": b.active, "slots": b.slots, "models": sorted(b.models)}
+            for b in backends]
  
  
 @app.post("/{path:path}")
@@ -280,25 +285,38 @@ async def proxy(path: str, request: Request):
     except Exception:
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
  
-    b = await acquire(model)
-    if b is None:
+    # Unknown model: no backend has it.
+    if not any(model in b.models for b in backends):
         return JSONResponse(
             {"error": {"message": f"model '{model}' not found on any backend",
                        "type": "invalid_request_error", "code": "model_not_found"}},
             status_code=404)
- 
-    client = httpx.AsyncClient(timeout=None)  # model loads can take a while
-    try:
-        req = client.build_request(
-            "POST", f"{b.url}/v1/{path}", content=body,
-            headers=backend_headers(b, request),
-        )
-        resp = await client.send(req, stream=True)
-    except Exception as e:
-        await client.aclose()
-        await release(b)
-        return JSONResponse({"error": f"backend {b.name}: {e}"}, status_code=502)
- 
+
+    # Try healthy backends; if one is down, mark it unhealthy and fail over.
+    while True:
+        b = await acquire(model)
+        if b is None:
+            return JSONResponse(
+                {"error": {"message": f"no healthy backend available for model '{model}'",
+                           "type": "server_error", "code": "backend_unavailable"}},
+                status_code=503)
+
+        client = httpx.AsyncClient(timeout=None)  # model loads can take a while
+        try:
+            req = client.build_request(
+                "POST", f"{b.url}/v1/{path}", content=body,
+                headers=backend_headers(b, request),
+            )
+            resp = await client.send(req, stream=True)
+            break
+        except Exception as e:
+            await client.aclose()
+            await release(b)
+            b.healthy = False
+            print(f"[router] backend {b.name} unreachable, marked unhealthy: "
+                  f"{type(e).__name__}: {e!r}")
+            # loop and try another healthy backend
+
     async def stream():
         try:
             async for chunk in resp.aiter_raw():
@@ -307,7 +325,7 @@ async def proxy(path: str, request: Request):
             await resp.aclose()
             await client.aclose()
             await release(b)
- 
+
     return StreamingResponse(
         stream(), status_code=resp.status_code,
         media_type=resp.headers.get("content-type"),
